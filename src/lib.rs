@@ -1,26 +1,12 @@
-#![cfg_attr(all(feature = "nightly", test), feature(test))]
-
-extern crate ndarray;
-extern crate num_traits;
-#[cfg(test)]
-extern crate rand;
-#[macro_use]
-extern crate log;
-
-#[cfg(all(feature = "nightly", test))]
-extern crate test;
-
+use log::trace;
+use nalgebra::{DMatrixView, DVectorView};
 use num_traits::Float;
 
 use std::fmt;
-use std::ops;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::ops::{AddAssign, SubAssign};
 
-pub type Matrix<T> = ndarray::Array2<T>;
-
-pub trait LapJVCost: Float + ops::AddAssign + ops::SubAssign + std::fmt::Debug {}
-impl<T> LapJVCost for T where T: Float + ops::AddAssign + ops::SubAssign + std::fmt::Debug {}
+pub trait LapJVCost: Float + AddAssign + SubAssign + std::fmt::Debug {}
+impl<T> LapJVCost for T where T: Float + AddAssign + SubAssign + std::fmt::Debug {}
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorKind {
@@ -50,48 +36,25 @@ impl std::fmt::Display for LapJVError {
 
 impl std::error::Error for LapJVError {}
 
-pub struct LapJV<'a, T: 'a> {
-    costs: &'a Matrix<T>,
-    dim: usize,
+#[derive(Default)]
+pub struct LapJV<T> {
     free_rows: Vec<usize>,
     v: Vec<T>,
     in_col: Vec<usize>,
     in_row: Vec<usize>,
-    cancellation: Cancellation,
-}
-
-/// Solve LAP problem given cost matrix
-/// This is an implementation of the LAPJV algorithm described in:
-/// R. Jonker, A. Volgenant. A Shortest Augmenting Path Algorithm for
-/// Dense and Sparse Linear Assignment Problems. Computing 38, 325-340
-/// (1987)
-pub fn lapjv<T>(costs: &Matrix<T>) -> Result<(Vec<usize>, Vec<usize>), LapJVError>
-where
-    T: LapJVCost,
-{
-    LapJV::new(costs).solve()
+    unique: Vec<bool>,
+    in_row_not_set: Vec<bool>,
+    pred: Vec<usize>,
+    collist: Vec<usize>,
+    cost_distance: Vec<T>,
 }
 
 /// Calculate solution cost by a result row
-pub fn cost<T>(input: &Matrix<T>, row: &[usize]) -> T
+pub fn cost<T>(input: DMatrixView<T>, row: &[usize]) -> T
 where
     T: LapJVCost,
 {
-    (0..row.len())
-        .fold(T::zero(), |acc, i| acc + input[(i, row[i])])
-}
-
-#[derive(Clone)]
-pub struct Cancellation(Arc<AtomicBool>);
-
-impl Cancellation {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst)
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
+    (0..row.len()).fold(T::zero(), |acc, i| acc + input[(i, row[i])])
 }
 
 /// Solve LAP problem given cost matrix
@@ -99,118 +62,112 @@ impl Cancellation {
 /// R. Jonker, A. Volgenant. A Shortest Augmenting Path Algorithm for
 /// Dense and Sparse Linear Assignment Problems. Computing 38, 325-340
 /// (1987)
-impl<'a, T> LapJV<'a, T>
+impl<'a, T> LapJV<T>
 where
-    T: LapJVCost,
+    T: LapJVCost + 'static,
 {
-    pub fn new(costs: &'a Matrix<T>) -> Self {
-        let dim = costs.dim().0; // square matrix dimensions
-        let free_rows = Vec::with_capacity(dim); // list of unassigned rows.
-        let v = Vec::with_capacity(dim);
-        let in_row = vec![0; dim];
-        let in_col = Vec::with_capacity(dim);
-        let cancellation = Cancellation(Default::default());
-        Self {
-            costs,
-            dim,
-            free_rows,
-            v,
-            in_col,
-            in_row,
-            cancellation
+    pub fn solve(
+        &'a mut self,
+        costs: DMatrixView<T>,
+    ) -> Result<(&'a Vec<usize>, &'a Vec<usize>), LapJVError> {
+        if !costs.is_square() {
+            return Err(LapJVError {
+                kind: ErrorKind::Msg("Input error: matrix is not square"),
+            });
         }
-    }
 
-    /// Returns a `Cancellation` token which can be cancelled from another thread.
-    pub fn cancellation(&self) -> Cancellation {
-        self.cancellation.clone()
-    }
+        let dim = costs.shape().0; // square matrix dimensions
 
-    fn check_cancelled(&self) -> Result<(), LapJVError> {
-        if self.cancellation.is_cancelled() {
-            return Err(LapJVError { kind: ErrorKind::Cancelled });
-        }
-        Ok(())
-    }
+        self.free_rows.reserve(dim);
+        self.free_rows.clear();
 
-    pub fn solve(mut self) -> Result<(Vec<usize>, Vec<usize>), LapJVError> {
-        if self.costs.dim().0 != self.costs.dim().1 {
-            return Err(LapJVError { kind: ErrorKind::Msg("Input error: matrix is not square") } );
-        }
-        self.ccrrt_dense();
+        self.v.clear();
+        self.v.reserve(dim);
+
+        self.in_row.clear();
+        self.in_row.resize(dim, 0);
+
+        self.in_col.clear();
+        self.in_col.reserve(dim);
+
+        self.ccrrt_dense(&costs);
 
         let mut i = 0;
         while !self.free_rows.is_empty() && i < 2 {
-            self.check_cancelled()?;
-            self.carr_dense();
+            self.carr_dense(&costs);
             i += 1;
         }
 
         if !self.free_rows.is_empty() {
-            self.ca_dense()?;
+            self.ca_dense(&costs)?;
         }
 
-        Ok((self.in_row, self.in_col))
+        Ok((&self.in_row, &self.in_col))
     }
 
     // Column-reduction and reduction transfer for a dense cost matrix
-    fn ccrrt_dense(&mut self) {
-        let mut unique = vec![true; self.dim];
-        let mut in_row_not_set = vec![true; self.dim];
-
-        for row in self.costs.lanes(ndarray::Axis(0)) {
-            let (min_index, min_value) = row.indexed_iter().skip(1).fold(
-                (0, row[0]),
-                |(old_idx, old_min), (new_idx, &new_min)| {
-                    if new_min < old_min {
-                        (new_idx, new_min)
+    fn ccrrt_dense(&'a mut self, costs: &DMatrixView<T>) {
+        for col in costs.column_iter() {
+            let (min_index, min_value) = col.iter().enumerate().skip(1).fold(
+                (0, col[0]),
+                |(old_idx, old_min), (new_idx, new_min)| {
+                    if *new_min < old_min {
+                        (new_idx, *new_min)
                     } else {
                         (old_idx, old_min)
                     }
                 },
             );
+
             self.in_col.push(min_index);
             self.v.push(min_value);
         }
 
-        for j in (0..self.dim).rev() {
+        self.unique.clear();
+        self.unique.resize(costs.shape().0, true);
+
+        self.in_row_not_set.clear();
+        self.in_row_not_set.resize(costs.shape().0, true);
+
+        for j in (0..costs.shape().0).rev() {
             let i = self.in_col[j];
-            if in_row_not_set[i] {
+            if self.in_row_not_set[i] {
                 self.in_row[i] = j;
-                in_row_not_set[i] = false;
+                self.in_row_not_set[i] = false;
             } else {
-                unique[i] = false;
+                self.unique[i] = false;
                 self.in_col[j] = std::usize::MAX;
             }
         }
 
-        for i in 0..self.dim {
-            if in_row_not_set[i] {
+        for i in 0..costs.shape().0 {
+            if self.in_row_not_set[i] {
                 self.free_rows.push(i);
-            } else if unique[i] {
+            } else if self.unique[i] {
                 let j = self.in_row[i];
                 let mut min = T::max_value();
-                for j2 in 0..self.dim {
+                for j2 in 0..costs.shape().0 {
                     if j2 == j {
                         continue;
                     }
-                    let c = self.reduced_cost(i, j2);
+                    let c = self.reduced_cost(costs, i, j2);
                     if c < min {
                         min = c;
                     }
                 }
+
                 self.v[j] -= min;
             }
         }
     }
 
     // Augmenting row reduction for a dense cost matrix
-    fn carr_dense(&mut self) {
+    fn carr_dense(&'a mut self, costs: &DMatrixView<T>) {
         // AUGMENTING ROW REDUCTION
         // scan all free rows.
         // in some cases, a free row may be replaced with another one to be scanned next.
         trace!("carr_dense");
-        let dim = self.dim;
+        let dim = costs.shape().0;
         let mut current = 0;
         let mut new_free_rows = 0; // start list of rows still free after augmenting row reduction.
         let mut rr_cnt = 0;
@@ -221,7 +178,8 @@ where
             let free_i = self.free_rows[current];
             current += 1;
             // find minimum and second minimum reduced cost over columns.
-            let (v1, v2, mut j1, j2) = find_umins_plain(self.costs.row(free_i), &self.v);
+            let row = costs.row(free_i).transpose();
+            let (v1, v2, mut j1, j2) = find_umins_plain(row.as_view(), &self.v);
 
             let mut i0 = self.in_col[j1];
             let v1_new = self.v[j1] - (v2 - v1);
@@ -264,27 +222,28 @@ where
     }
 
     // Augment for a dense cost matrix
-    fn ca_dense(&mut self) -> Result<(), LapJVError> {
-        let dim = self.dim;
-        let mut pred = vec![0; dim];
+    fn ca_dense(&'a mut self, costs: &DMatrixView<T>) -> Result<(), LapJVError> {
+        let dim = costs.shape().0;
+        self.pred.clear();
+        self.pred.resize(dim, 0);
 
         let free_rows = std::mem::replace(&mut self.free_rows, vec![]);
         for freerow in free_rows {
             trace!("looking at freerow={}", freerow);
 
-            self.check_cancelled()?;
-
             let mut i = std::usize::MAX;
             let mut k = 0;
-            let mut j = self.find_path_dense(freerow, &mut pred);
+            let mut j = self.find_path_dense(costs, freerow);
             debug_assert!(j < dim);
             while i != freerow {
-                i = pred[j];
+                i = self.pred[j];
                 self.in_col[j] = i;
                 std::mem::swap(&mut j, &mut self.in_row[i]);
                 k += 1;
                 if k > dim {
-                    return Err(LapJVError { kind: ErrorKind::Msg("Error: ca_dense will not finish") });
+                    return Err(LapJVError {
+                        kind: ErrorKind::Msg("Error: ca_dense will not finish"),
+                    });
                 }
             }
         }
@@ -293,10 +252,14 @@ where
 
     /// Single iteration of modified Dijkstra shortest path algorithm as explained in the JV paper
     /// return The closest free column index
-    fn find_path_dense(&mut self, start_i: usize, pred: &mut [usize]) -> usize {
-        let dim = self.dim;
-        let mut collist = Vec::with_capacity(dim); // list of columns to be scanned in various ways.
-        let mut d = Vec::with_capacity(dim); // 'cost-distance' in augmenting path calculation.
+    fn find_path_dense(&'a mut self, costs: &DMatrixView<T>, start_i: usize) -> usize {
+        let dim = costs.shape().0;
+
+        self.collist.clear();
+        self.collist.reserve(dim); // list of columns to be scanned in various ways.
+
+        self.cost_distance.clear();
+        self.cost_distance.reserve(dim); // 'cost-distance' in augmenting path calculation.
 
         let mut lo = 0;
         let mut hi = 0;
@@ -305,22 +268,23 @@ where
         // Dijkstra shortest path algorithm.
         // runs until unassigned column added to shortest path tree.
         for i in 0..dim {
-            collist.push(i);
-            d.push(self.reduced_cost(start_i, i));
-            pred[i] = start_i;
+            self.collist.push(i);
+            self.cost_distance
+                .push(self.reduced_cost(costs, start_i, i));
+            self.pred[i] = start_i;
         }
 
-        trace!("d: {:?}", d);
+        trace!("d: {:?}", self.cost_distance);
         let mut final_j = None;
         while final_j.is_none() {
             if lo == hi {
                 trace!("{}..{} -> find", lo, hi);
                 n_ready = lo;
-                hi = find_dense(dim, lo, &d, &mut collist);
+                hi = find_dense(dim, lo, &self.cost_distance, self.collist.as_mut_slice());
                 trace!("check {}..{}", lo, hi);
                 // check if any of the minimum columns happens to be unassigned.
                 // if so, we have an augmenting path right away.
-                for &j in collist.iter().take(hi).skip(lo) {
+                for &j in self.collist.iter().take(hi).skip(lo) {
                     if self.in_col[j] == std::usize::MAX {
                         final_j = Some(j);
                     }
@@ -329,15 +293,15 @@ where
 
             if final_j.is_none() {
                 trace!("{}..{} -> scan", lo, hi);
-                final_j = self.scan_dense(&mut lo, &mut hi, &mut d, &mut collist, pred);
+                final_j = self.scan_dense(costs, &mut lo, &mut hi);
             }
         }
 
         trace!("found final_j={:?}", final_j);
-        trace!("cols={:?}", collist);
-        let mind = d[collist[lo]];
-        for &j in collist.iter().take(n_ready) {
-            self.v[j] += d[j] - mind;
+        trace!("cols={:?}", self.collist);
+        let mind = self.cost_distance[self.collist[lo]];
+        for &j in self.collist.iter().take(n_ready) {
+            self.v[j] += self.cost_distance[j] - mind;
         }
         final_j.unwrap()
     }
@@ -345,35 +309,33 @@ where
     // Scan all columns in TODO starting from arbitrary column in SCAN
     // and try to decrease d of the TODO columns using the SCAN column
     fn scan_dense(
-        &self,
+        &mut self,
+        costs: &DMatrixView<T>,
         plo: &mut usize,
         phi: &mut usize,
-        d: &mut [T],
-        collist: &mut [usize],
-        pred: &mut [usize],
     ) -> Option<usize> {
         let mut lo = *plo;
         let mut hi = *phi;
         while lo != hi {
-            let j = collist[lo];
+            let j = self.collist[lo];
             lo += 1;
             let i = self.in_col[j];
-            let mind = d[j];
-            let h = self.reduced_cost(i, j) - mind;
+            let mind = self.cost_distance[j];
+            let h = self.reduced_cost(costs, i, j) - mind;
             // For all columns in TODO
-            for k in hi..collist.len() {
-                let j = collist[k];
-                let cred_ij = self.reduced_cost(i, j) - h;
-                if cred_ij < d[j] {
-                    d[j] = cred_ij;
-                    pred[j] = i;
+            for k in hi..self.collist.len() {
+                let j = self.collist[k];
+                let cred_ij = self.reduced_cost(costs, i, j) - h;
+                if cred_ij < self.cost_distance[j] {
+                    self.cost_distance[j] = cred_ij;
+                    self.pred[j] = i;
                     if (cred_ij - mind).abs() < T::epsilon() {
                         // if cred_ij == mind {
                         if self.in_col[j] == std::usize::MAX {
                             return Some(j);
                         }
-                        collist[k] = collist[hi];
-                        collist[hi] = j;
+                        self.collist[k] = self.collist[hi];
+                        self.collist[hi] = j;
                         hi += 1;
                     }
                 }
@@ -382,17 +344,13 @@ where
         // Note: only change lo and hi if the item was not found
         *plo = lo;
         *phi = hi;
+
         None
     }
 
     #[inline(always)]
-    fn cost(&self, i: usize, j: usize) -> T {
-        self.costs[(i, j)]
-    }
-
-    #[inline(always)]
-    fn reduced_cost(&self, i: usize, j: usize) -> T {
-        self.cost(i, j) - self.v[j]
+    fn reduced_cost(&'a self, costs: &DMatrixView<T>, i: usize, j: usize) -> T {
+        costs[(i, j)] - self.v[j]
     }
 }
 
@@ -422,7 +380,7 @@ where
 
 // Finds minimum and second minimum from a row, returns (min, second_min, min_index, second_min_index)
 #[inline(always)]
-fn find_umins_plain<T>(local_cost: ndarray::ArrayView1<T>, v: &[T]) -> (T, T, usize, Option<usize>)
+fn find_umins_plain<T>(local_cost: DVectorView<T>, v: &[T]) -> (T, T, usize, Option<usize>)
 where
     T: LapJVCost,
 {
@@ -430,7 +388,7 @@ where
     let mut usubmin = T::max_value();
     let mut j1 = 0;
     let mut j2 = None;
-    for j in 1..local_cost.dim() {
+    for j in 1..local_cost.shape().0 {
         let h = local_cost[j] - v[j];
         if h < usubmin {
             if h >= umin {
@@ -450,39 +408,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand;
+    use nalgebra::{DMatrix, DVector, SMatrix};
+    use rand::{self, Rng};
 
     #[test]
     fn it_works() {
-        let m = Matrix::from_shape_vec((3, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
-            .unwrap();
-        let result = lapjv(&m).unwrap();
-        assert_eq!(result.0, vec![2, 0, 1]);
-        assert_eq!(result.1, vec![1, 2, 0]);
-    }
+        let mut solver = LapJV::default();
 
-    #[test]
-    fn cancellation() {
-        let m = Matrix::from_shape_vec((3, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
-            .unwrap();
-        let lapjv = LapJV::new(&m);
-        let cancellation = lapjv.cancellation();
-        cancellation.cancel();
-        let result = lapjv.solve();
-        assert!(matches!(result, Err(LapJVError { kind: ErrorKind::Cancelled })));
+        // Solve once
+        {
+            let m: SMatrix<f32, 4, 4> = SMatrix::from_row_slice(&[
+                1.0, 2.0, 3.0, 0.2, //
+                4.0, 5.0, 6.0, 0.1, //
+                7.0, 8.0, 9.0, 0.1, //
+                0.2, 0.3, 0.4, 0.5, //
+            ]);
+
+            let result = solver.solve(m.as_view()).unwrap();
+            assert_eq!(*result.0, vec![0, 1, 3, 2]);
+            assert_eq!(*result.1, vec![0, 1, 3, 2]);
+        }
+
+        // Solve another problem, using the same solver.
+        // This call should not allocate any memory, and instead use
+        // the memory used in the previous execution.
+        {
+            let m: SMatrix<f32, 3, 3> = SMatrix::from_row_slice(&[
+                1.0, 2.0, 3.0, //
+                4.0, 5.0, 6.0, //
+                7.0, 8.0, 9.0, //
+            ]);
+
+            let result = solver.solve(m.as_view()).unwrap();
+            assert_eq!(*result.0, vec![2, 0, 1]);
+            assert_eq!(*result.1, vec![1, 2, 0]);
+        }
     }
 
     #[test]
     fn test_solve_random10() {
         let (m, result) = solve_random10();
-        let cost = cost(&m, &result.0);
+        let cost = cost(m.as_view(), &result.0);
         assert_eq!(cost, 1071.0);
         assert_eq!(result.0, vec![7, 9, 3, 4, 1, 0, 5, 6, 2, 8]);
     }
 
     #[test]
     fn test_solve_inf1() {
-        let c = vec![
+        let c = &[
             std::f64::INFINITY,
             643.0,
             717.0,
@@ -584,54 +557,56 @@ mod tests {
             86.0,
             74.0,
         ];
-        let m = Matrix::from_shape_vec((10, 10), c).unwrap();
-        let result = lapjv(&m).unwrap();
-        let cost = cost(&m, &result.0);
+
+        let m: SMatrix<f64, 10, 10> = SMatrix::from_row_slice(c);
+        let mut solver = LapJV::default();
+        let result = solver.solve(m.as_view()).unwrap();
+        let cost = cost(m.as_view(), &result.0);
+
         assert_eq!(cost, 1403.0);
-        assert_eq!(result.0, vec![7, 9, 3, 8, 1, 4, 5, 6, 2, 0]);
+        assert_eq!(*result.0, vec![7, 9, 3, 8, 1, 4, 5, 6, 2, 0]);
     }
 
     #[test]
     fn test_find_umins() {
-        let m = Matrix::from_shape_vec((3, 3), vec![25.0, 0.0, 15.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
-            .unwrap();
-        let result = find_umins_plain(m.row(0), &vec![0.0, 0.0, 0.0]);
-        println!("Result: {:?}", result);
+        let row = DVector::from_row_slice(&[25.0, 0.0, 15.0]);
+        let row: DVectorView<f64> = row.as_view();
+
+        let result = find_umins_plain(row, &vec![0.0, 0.0, 0.0]);
         assert_eq!(result, (0.0, 15.0, 1, Some(2)));
     }
 
     #[test]
     fn test_random() {
-        const DIM: usize = 512;
-        let mut m = Vec::with_capacity(DIM * DIM);
-        for _ in 0..DIM * DIM {
-            m.push(rand::random::<f64>() * 100.0);
-        }
-        let m = Matrix::from_shape_vec((DIM, DIM), m).unwrap();
-        let _result = lapjv(&m).unwrap();
+        let mut rng = rand::rng();
+        let m: DMatrix<f64> = DMatrix::from_fn(10, 10, |_, _| rng.random::<f64>() * 100.0);
+        let mut solver = LapJV::default();
+        let _result = solver.solve(m.as_view()).unwrap();
     }
 
-    fn solve_random10() -> (Matrix<f64>, (Vec<usize>, Vec<usize>)) {
-        const N: usize = 10;
-        let c = vec![
-            612.0, 643.0, 717.0, 2.0, 946.0, 534.0, 242.0, 235.0, 376.0, 839.0, 224.0, 141.0,
-            799.0, 180.0, 386.0, 745.0, 592.0, 822.0, 421.0, 42.0, 241.0, 369.0, 831.0, 67.0,
-            258.0, 549.0, 615.0, 529.0, 458.0, 524.0, 231.0, 649.0, 287.0, 910.0, 12.0, 820.0,
-            31.0, 92.0, 217.0, 555.0, 912.0, 81.0, 568.0, 241.0, 292.0, 653.0, 417.0, 652.0, 630.0,
-            788.0, 32.0, 822.0, 788.0, 166.0, 122.0, 690.0, 304.0, 568.0, 449.0, 214.0, 441.0,
-            469.0, 584.0, 633.0, 213.0, 414.0, 498.0, 500.0, 317.0, 391.0, 798.0, 581.0, 183.0,
-            420.0, 16.0, 748.0, 35.0, 516.0, 639.0, 356.0, 351.0, 921.0, 67.0, 33.0, 592.0, 775.0,
-            780.0, 335.0, 464.0, 788.0, 771.0, 455.0, 950.0, 25.0, 22.0, 576.0, 969.0, 122.0, 86.0,
-            74.0,
+    fn solve_random10() -> (SMatrix<f64, 10, 10>, (Vec<usize>, Vec<usize>)) {
+        let c = &[
+            612.0, 643.0, 717.0, 2.0, 946.0, 534.0, 242.0, 235.0, 376.0, 839.0, //
+            224.0, 141.0, 799.0, 180.0, 386.0, 745.0, 592.0, 822.0, 421.0, 42.0, //
+            241.0, 369.0, 831.0, 67.0, 258.0, 549.0, 615.0, 529.0, 458.0, 524.0, //
+            231.0, 649.0, 287.0, 910.0, 12.0, 820.0, 31.0, 92.0, 217.0, 555.0, //
+            912.0, 81.0, 568.0, 241.0, 292.0, 653.0, 417.0, 652.0, 630.0, 788.0, //
+            32.0, 822.0, 788.0, 166.0, 122.0, 690.0, 304.0, 568.0, 449.0, 214.0, //
+            441.0, 469.0, 584.0, 633.0, 213.0, 414.0, 498.0, 500.0, 317.0, 391.0, //
+            798.0, 581.0, 183.0, 420.0, 16.0, 748.0, 35.0, 516.0, 639.0, 356.0, //
+            351.0, 921.0, 67.0, 33.0, 592.0, 775.0, 780.0, 335.0, 464.0, 788.0, //
+            771.0, 455.0, 950.0, 25.0, 22.0, 576.0, 969.0, 122.0, 86.0, 74.0, //
         ];
-        let m = Matrix::from_shape_vec((N, N), c).unwrap();
-        let result = lapjv(&m).unwrap();
-        (m, result)
+
+        let m: SMatrix<f64, 10, 10> = SMatrix::from_row_slice(c);
+        let mut solver = LapJV::default();
+        let result = solver.solve(m.as_view()).unwrap();
+        (m, (result.0.clone(), result.1.clone()))
     }
 
     #[test]
     fn dim_size_augmentation_path() {
-        let m = vec![
+        let m = &[
             849.096136535884,
             964.7344199800348,
             1658.3745235461179,
@@ -649,8 +624,10 @@ mod tests {
             3663.2542984837355,
             2926.089718214265,
         ];
-        let matrix = Matrix::from_shape_vec((4, 4), m).unwrap();
-        let result = lapjv(&matrix);
+
+        let m: SMatrix<f64, 4, 4> = SMatrix::from_row_slice(m);
+        let mut solver = LapJV::default();
+        let result = solver.solve(m.as_view());
         result.unwrap();
     }
 
