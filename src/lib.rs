@@ -179,7 +179,7 @@ where
             let free_i = self.free_rows[current];
             current += 1;
             // find minimum and second minimum reduced cost over columns.
-            let row = costs.row(free_i).transpose(); // TODO: remove it!!!
+            let row = costs.row(free_i);
             let (v1, v2, mut j1, j2) = find_umins_plain(row.as_view(), &self.v);
 
             let mut i0 = self.in_col[j1];
@@ -412,16 +412,16 @@ where
 
 // Finds minimum and second minimum from a row, returns (min, second_min, min_index, second_min_index)
 #[inline(always)]
-fn find_umins_plain<T>(local_cost: DVectorView<T>, v: &[T]) -> (T, T, usize, Option<usize>)
+fn find_umins_plain<T>(local_cost: DMatrixView<T>, v: &[T]) -> (T, T, usize, Option<usize>)
 where
     T: LapJVCost,
 {
-    let mut umin = local_cost[0] - v[0];
+    let mut umin = local_cost[(0, 0)] - v[0];
     let mut usubmin = T::max_value();
     let mut j1 = 0;
     let mut j2 = None;
-    for j in 1..local_cost.shape().0 {
-        let h = local_cost[j] - v[j];
+    for j in 1..local_cost.shape().1 {
+        let h = local_cost[(0, j)] - v[j];
         if h < usubmin {
             if h >= umin {
                 usubmin = h;
@@ -601,10 +601,8 @@ mod tests {
 
     #[test]
     fn test_find_umins() {
-        let row = DVector::from_row_slice(&[25.0, 0.0, 15.0]);
-        let row: DVectorView<f64> = row.as_view();
-
-        let result = find_umins_plain(row, &vec![0.0, 0.0, 0.0]);
+        let row = DVector::from_row_slice(&[25.0, 0.0, 15.0]).transpose();
+        let result = find_umins_plain(row.as_view(), &vec![0.0, 0.0, 0.0]);
         assert_eq!(result, (0.0, 15.0, 1, Some(2)));
     }
 
