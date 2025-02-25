@@ -39,6 +39,7 @@ impl std::error::Error for LapJVError {}
 #[derive(Default)]
 pub struct LapJV<T> {
     free_rows: Vec<usize>,
+    free_rows_util: Vec<usize>,
     v: Vec<T>,
     in_col: Vec<usize>,
     in_row: Vec<usize>,
@@ -150,7 +151,7 @@ where
                     if j2 == j {
                         continue;
                     }
-                    let c = self.reduced_cost(costs, i, j2);
+                    let c = reduced_cost(costs, &mut self.v, i, j2);
                     if c < min {
                         min = c;
                     }
@@ -178,7 +179,7 @@ where
             let free_i = self.free_rows[current];
             current += 1;
             // find minimum and second minimum reduced cost over columns.
-            let row = costs.row(free_i).transpose();
+            let row = costs.row(free_i).transpose(); // TODO: remove it!!!
             let (v1, v2, mut j1, j2) = find_umins_plain(row.as_view(), &self.v);
 
             let mut i0 = self.in_col[j1];
@@ -227,15 +228,26 @@ where
         self.pred.clear();
         self.pred.resize(dim, 0);
 
-        let free_rows = std::mem::replace(&mut self.free_rows, vec![]);
-        for freerow in free_rows {
+        self.free_rows_util.clear();
+        self.free_rows_util.clone_from(&self.free_rows);
+        self.free_rows.clear();
+
+        for freerow in self.free_rows_util.iter() {
             trace!("looking at freerow={}", freerow);
 
             let mut i = std::usize::MAX;
             let mut k = 0;
-            let mut j = self.find_path_dense(costs, freerow);
+            let mut j = find_path_dense(
+                costs,
+                *freerow,
+                &mut self.collist,
+                &mut self.cost_distance,
+                &mut self.pred,
+                &mut self.in_col,
+                &mut self.v,
+            );
             debug_assert!(j < dim);
-            while i != freerow {
+            while i != *freerow {
                 i = self.pred[j];
                 self.in_col[j] = i;
                 std::mem::swap(&mut j, &mut self.in_row[i]);
@@ -249,109 +261,129 @@ where
         }
         Ok(())
     }
+}
 
-    /// Single iteration of modified Dijkstra shortest path algorithm as explained in the JV paper
-    /// return The closest free column index
-    fn find_path_dense(&'a mut self, costs: &DMatrixView<T>, start_i: usize) -> usize {
-        let dim = costs.shape().0;
+#[inline(always)]
+fn reduced_cost<T: LapJVCost>(costs: &DMatrixView<T>, v: &mut Vec<T>, i: usize, j: usize) -> T {
+    costs[(i, j)] - v[j]
+}
 
-        self.collist.clear();
-        self.collist.reserve(dim); // list of columns to be scanned in various ways.
-
-        self.cost_distance.clear();
-        self.cost_distance.reserve(dim); // 'cost-distance' in augmenting path calculation.
-
-        let mut lo = 0;
-        let mut hi = 0;
-        let mut n_ready = 0;
-
-        // Dijkstra shortest path algorithm.
-        // runs until unassigned column added to shortest path tree.
-        for i in 0..dim {
-            self.collist.push(i);
-            self.cost_distance
-                .push(self.reduced_cost(costs, start_i, i));
-            self.pred[i] = start_i;
-        }
-
-        trace!("d: {:?}", self.cost_distance);
-        let mut final_j = None;
-        while final_j.is_none() {
-            if lo == hi {
-                trace!("{}..{} -> find", lo, hi);
-                n_ready = lo;
-                hi = find_dense(dim, lo, &self.cost_distance, self.collist.as_mut_slice());
-                trace!("check {}..{}", lo, hi);
-                // check if any of the minimum columns happens to be unassigned.
-                // if so, we have an augmenting path right away.
-                for &j in self.collist.iter().take(hi).skip(lo) {
-                    if self.in_col[j] == std::usize::MAX {
-                        final_j = Some(j);
+// Scan all columns in TODO starting from arbitrary column in SCAN
+// and try to decrease d of the TODO columns using the SCAN column
+fn scan_dense<T: LapJVCost>(
+    costs: &DMatrixView<T>,
+    plo: &mut usize,
+    phi: &mut usize,
+    collist: &mut Vec<usize>,
+    cost_distance: &mut Vec<T>,
+    pred: &mut Vec<usize>,
+    in_col: &mut Vec<usize>,
+    v: &mut Vec<T>,
+) -> Option<usize> {
+    let mut lo = *plo;
+    let mut hi = *phi;
+    while lo != hi {
+        let j = collist[lo];
+        lo += 1;
+        let i = in_col[j];
+        let mind = cost_distance[j];
+        let h = reduced_cost(costs, v, i, j) - mind;
+        // For all columns in TODO
+        for k in hi..collist.len() {
+            let j = collist[k];
+            let cred_ij = reduced_cost(costs, v, i, j) - h;
+            if cred_ij < cost_distance[j] {
+                cost_distance[j] = cred_ij;
+                pred[j] = i;
+                if (cred_ij - mind).abs() < T::epsilon() {
+                    // if cred_ij == mind {
+                    if in_col[j] == std::usize::MAX {
+                        return Some(j);
                     }
-                }
-            }
-
-            if final_j.is_none() {
-                trace!("{}..{} -> scan", lo, hi);
-                final_j = self.scan_dense(costs, &mut lo, &mut hi);
-            }
-        }
-
-        trace!("found final_j={:?}", final_j);
-        trace!("cols={:?}", self.collist);
-        let mind = self.cost_distance[self.collist[lo]];
-        for &j in self.collist.iter().take(n_ready) {
-            self.v[j] += self.cost_distance[j] - mind;
-        }
-        final_j.unwrap()
-    }
-
-    // Scan all columns in TODO starting from arbitrary column in SCAN
-    // and try to decrease d of the TODO columns using the SCAN column
-    fn scan_dense(
-        &mut self,
-        costs: &DMatrixView<T>,
-        plo: &mut usize,
-        phi: &mut usize,
-    ) -> Option<usize> {
-        let mut lo = *plo;
-        let mut hi = *phi;
-        while lo != hi {
-            let j = self.collist[lo];
-            lo += 1;
-            let i = self.in_col[j];
-            let mind = self.cost_distance[j];
-            let h = self.reduced_cost(costs, i, j) - mind;
-            // For all columns in TODO
-            for k in hi..self.collist.len() {
-                let j = self.collist[k];
-                let cred_ij = self.reduced_cost(costs, i, j) - h;
-                if cred_ij < self.cost_distance[j] {
-                    self.cost_distance[j] = cred_ij;
-                    self.pred[j] = i;
-                    if (cred_ij - mind).abs() < T::epsilon() {
-                        // if cred_ij == mind {
-                        if self.in_col[j] == std::usize::MAX {
-                            return Some(j);
-                        }
-                        self.collist[k] = self.collist[hi];
-                        self.collist[hi] = j;
-                        hi += 1;
-                    }
+                    collist[k] = collist[hi];
+                    collist[hi] = j;
+                    hi += 1;
                 }
             }
         }
-        // Note: only change lo and hi if the item was not found
-        *plo = lo;
-        *phi = hi;
+    }
+    // Note: only change lo and hi if the item was not found
+    *plo = lo;
+    *phi = hi;
 
-        None
+    None
+}
+
+/// Single iteration of modified Dijkstra shortest path algorithm as explained in the JV paper
+/// return The closest free column index
+fn find_path_dense<T: LapJVCost>(
+    costs: &DMatrixView<T>,
+    start_i: usize,
+    collist: &mut Vec<usize>,
+    cost_distance: &mut Vec<T>,
+    pred: &mut Vec<usize>,
+    in_col: &mut Vec<usize>,
+    v: &mut Vec<T>,
+) -> usize {
+    let dim = costs.shape().0;
+
+    collist.clear();
+    collist.reserve(dim); // list of columns to be scanned in various ways.
+
+    cost_distance.clear();
+    cost_distance.reserve(dim); // 'cost-distance' in augmenting path calculation.
+
+    let mut lo = 0;
+    let mut hi = 0;
+    let mut n_ready = 0;
+
+    // Dijkstra shortest path algorithm.
+    // runs until unassigned column added to shortest path tree.
+    for i in 0..dim {
+        collist.push(i);
+        cost_distance.push(reduced_cost(costs, v, start_i, i));
+        pred[i] = start_i;
     }
 
-    #[inline(always)]
-    fn reduced_cost(&'a self, costs: &DMatrixView<T>, i: usize, j: usize) -> T {
-        costs[(i, j)] - self.v[j]
+    trace!("d: {:?}", cost_distance);
+    let mut final_j = None;
+    while final_j.is_none() {
+        if lo == hi {
+            trace!("{}..{} -> find", lo, hi);
+            n_ready = lo;
+            hi = find_dense(dim, lo, &cost_distance, collist.as_mut_slice());
+            trace!("check {}..{}", lo, hi);
+            // check if any of the minimum columns happens to be unassigned.
+            // if so, we have an augmenting path right away.
+            for &j in collist.iter().take(hi).skip(lo) {
+                if in_col[j] == std::usize::MAX {
+                    final_j = Some(j);
+                }
+            }
+        }
+
+        if final_j.is_none() {
+            trace!("{}..{} -> scan", lo, hi);
+            final_j = scan_dense(
+                costs,
+                &mut lo,
+                &mut hi,
+                collist,
+                cost_distance,
+                pred,
+                in_col,
+                v,
+            );
+        }
     }
+
+    trace!("found final_j={:?}", final_j);
+    trace!("cols={:?}", collist);
+    let mind = cost_distance[collist[lo]];
+    for &j in collist.iter().take(n_ready) {
+        v[j] += cost_distance[j] - mind;
+    }
+    final_j.unwrap()
 }
 
 fn find_dense<T>(dim: usize, lo: usize, d: &[T], collist: &mut [usize]) -> usize
