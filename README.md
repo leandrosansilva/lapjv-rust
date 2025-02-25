@@ -14,10 +14,15 @@ This is rust implementation of the Jonker-Volgenant algorithm for linear assignm
 ## Example usage:
 
 ```rust
-use lapjv::lapjv;
+use lapjv::LapJV;
+use nalgebra::DMatrixView;
 
-let m = Matrix::from_shape_vec((3, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).unwrap();
-let result = lapjv(&m).unwrap();
-assert_eq!(result.0, vec![2, 0, 1]);
-assert_eq!(result.1, vec![1, 2, 0]);
+let mut solver = LapJV::default();
+let m: SMatrix<f64, 3, 3> = SMatrix::from_row_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+let result = solver.solve(m.as_view()).unwrap();
+assert_eq!(*result.0, vec![2, 0, 1]);
+assert_eq!(*result.1, vec![1, 2, 0]);
 ```
+
+You can call `solver.solve()` any arbitrary number of times, so that it will try to reuse the
+same dynamic allocated memory across the usages, likely increasing performance.
