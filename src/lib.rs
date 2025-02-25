@@ -1,4 +1,4 @@
-use nalgebra::{DMatrixView, DVectorView};
+use nalgebra::DMatrixView;
 use num_traits::Float;
 
 use std::fmt;
