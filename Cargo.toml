@@ -16,7 +16,6 @@ travis-ci = { repository = "Antti/lapjv-rust", branch = "master" }
 maintenance = { status = "as-is" }
 
 [dependencies]
-log = "0.4.26"
 nalgebra = "0.33.2"
 num-traits = "0.2.19"
 rand = "0.9.0"

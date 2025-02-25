@@ -1,4 +1,3 @@
-use log::trace;
 use nalgebra::{DMatrixView, DVectorView};
 use num_traits::Float;
 
@@ -167,7 +166,6 @@ where
         // AUGMENTING ROW REDUCTION
         // scan all free rows.
         // in some cases, a free row may be replaced with another one to be scanned next.
-        trace!("carr_dense");
         let dim = costs.shape().0;
         let mut current = 0;
         let mut new_free_rows = 0; // start list of rows still free after augmenting row reduction.
@@ -233,8 +231,6 @@ where
         self.free_rows.clear();
 
         for freerow in self.free_rows_util.iter() {
-            trace!("looking at freerow={}", freerow);
-
             let mut i = std::usize::MAX;
             let mut k = 0;
             let mut j = find_path_dense(
@@ -345,14 +341,11 @@ fn find_path_dense<T: LapJVCost>(
         pred[i] = start_i;
     }
 
-    trace!("d: {:?}", cost_distance);
     let mut final_j = None;
     while final_j.is_none() {
         if lo == hi {
-            trace!("{}..{} -> find", lo, hi);
             n_ready = lo;
             hi = find_dense(dim, lo, &cost_distance, collist.as_mut_slice());
-            trace!("check {}..{}", lo, hi);
             // check if any of the minimum columns happens to be unassigned.
             // if so, we have an augmenting path right away.
             for &j in collist.iter().take(hi).skip(lo) {
@@ -363,7 +356,6 @@ fn find_path_dense<T: LapJVCost>(
         }
 
         if final_j.is_none() {
-            trace!("{}..{} -> scan", lo, hi);
             final_j = scan_dense(
                 costs,
                 &mut lo,
@@ -377,8 +369,6 @@ fn find_path_dense<T: LapJVCost>(
         }
     }
 
-    trace!("found final_j={:?}", final_j);
-    trace!("cols={:?}", collist);
     let mind = cost_distance[collist[lo]];
     for &j in collist.iter().take(n_ready) {
         v[j] += cost_distance[j] - mind;
